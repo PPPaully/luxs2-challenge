@@ -228,7 +228,7 @@ class VectorWrapper(gym.Wrapper):
             return unit.self_destruct()
         return None
 
-    def action(self, action):
+    def action(self, action, with_opponent=True):
         act_start = time()
         # self = envs.envs[0]
         # action = new_actions[0]
@@ -244,7 +244,7 @@ class VectorWrapper(gym.Wrapper):
                 act = self.factory_action(factory, action['factories'][idx], self.last_game_state, len(self.units_set))
                 if act is not None:
                     actions[player][fidx] = act
-            elif fidx in self.opponent_factories_set:
+            elif with_opponent and fidx in self.opponent_factories_set:
                 factory = self.last_game_state.factories[opponent][fidx]
                 act = self.factory_action(factory, action['factories'][idx], self.last_opponent_game_state, len(self.opponent_units_set))
                 if act is not None:
@@ -257,7 +257,7 @@ class VectorWrapper(gym.Wrapper):
                 act = self.unit_action(unit, action['units'][idx], self.last_game_state)
                 if act is not None:
                     actions[player][uidx] = [act]
-            elif uidx in self.opponent_units_set:
+            elif with_opponent and  uidx in self.opponent_units_set:
                 unit = self.last_game_state.units[opponent][uidx]
                 act = self.unit_action(unit, action['units'][idx], self.last_opponent_game_state)
                 if act is not None:
@@ -265,11 +265,11 @@ class VectorWrapper(gym.Wrapper):
         self.time_stats['action'].append(time() - act_start)
         return actions
 
-    def step(self, action):
+    def step(self, action, with_opponent=True):
         step_start = time()
         player = 'player_0'
         opponent = 'player_1'
-        observation, reward, done, info = self.env.step(self.action(action))
+        observation, reward, done, info = self.env.step(self.action(action, with_opponent))
         self.last_game_state = obs_to_game_state(self.lux_env.env_steps, self.lux_env.env_cfg, observation[player])
         self.last_opponent_game_state = obs_to_game_state(self.lux_env.env_steps, self.lux_env.env_cfg, observation[opponent])
         self.time_stats['step'].append(time() - step_start)

@@ -571,7 +571,7 @@ def test():
     from lux.utils import draw
 
     num_envs = 4
-    envs = gym.vector.SyncVectorEnv([create_env() for _ in range(num_envs)])
+    envs = gym.vector.SyncVectorEnv([create_env(with_opponent=False) for _ in range(num_envs)])
     agent = Agent(envs)
 
     for env_id, env in enumerate(envs.envs):

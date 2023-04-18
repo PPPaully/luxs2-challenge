@@ -9,9 +9,10 @@ from parallel_env import VectorWrapper
 
 
 class SkipSetupWrapper(gym.Wrapper):
-    def __init__(self, env: VectorWrapper):
+    def __init__(self, env: VectorWrapper, with_opponent=True):
         super().__init__(env)
         self.env = env
+        self.with_opponent = with_opponent
         self.prev_step_metrics = None
 
     def set_agent(self, agent, env_id=None):
@@ -44,7 +45,14 @@ class SkipSetupWrapper(gym.Wrapper):
             Return single ('player_0') reward only
         '''
         player = 'player_0'
-        observation, rewards, dones, _ = self.env.step(action)
+        opponent = 'player_1'
+        if not self.with_opponent:
+            opp_factories = self.env.state.factories[opponent]
+            for k in opp_factories.keys():
+                factory = opp_factories[k]
+                factory.cargo.water = 1000 # Keep enemy alive
+
+        observation, rewards, dones, _ = self.env.step(action, self.with_opponent)
 
         infos = dict()
         stats: StatsStateDict = self.env.lux_env.state.stats[player]
@@ -73,11 +81,11 @@ class SkipSetupWrapper(gym.Wrapper):
         return observation, rewards[player], dones[player], infos
 
 
-def create_env():
+def create_env(with_opponent=False):
     def thunk() -> VectorWrapper:
         env = LuxAI_S2(collect_stats=True)
         env = VectorWrapper(env)
-        env = SkipSetupWrapper(env)
+        env = SkipSetupWrapper(env, with_opponent)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
     return thunk

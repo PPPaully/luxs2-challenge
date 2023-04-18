@@ -11,7 +11,9 @@ from lux.utils import draw
 num_envs = 4
 device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
-envs = gym.vector.SyncVectorEnv([create_env() for _ in range(num_envs)])
+envs = gym.vector.SyncVectorEnv([
+    create_env(with_opponent=False) for _ in range(num_envs)
+])
 agent = Agent(envs, is_cuda=True).to(device)
 
 for env_id, env in enumerate(envs.envs):
@@ -77,8 +79,8 @@ print(f'ENV. - T.Observation   : {np.mean(all_envs_stats["observation"])*1000:4.
 print(f'ENV. - T.Action        : {np.mean(all_envs_stats["action"])*1000:4.0f} ms ({1/np.mean(all_envs_stats["action"]):8.2f}/s) x {len(all_envs_stats["action"]):4d} times - Total {np.sum(all_envs_stats["action"]):6.2f} secs')
 print(f'ENV. - Step            : {np.mean(all_envs_stats["step"])*1000:4.0f} ms ({1/np.mean(all_envs_stats["step"]):8.2f}/s) x {len(all_envs_stats["step"]):4d} times - Total {np.sum(all_envs_stats["step"]):6.2f} secs')
 
-# for env_id, env in enumerate(envs.envs):
-#     draw(env.lux_env)
+for env_id, env in enumerate(envs.envs):
+    draw(env.lux_env)
 
 # sum([np.prod(p.shape) for p in agent.parameters(True)])
 
