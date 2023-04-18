@@ -206,22 +206,22 @@ class Agent(nn.Module):
         transformed = dict()
         map_size = observation_input['ice'].shape[1]
         # Map
-        transformed['ice'] = observation_input['ice'].astype(np.float32)  # Already 0-1
-        transformed['ore'] = observation_input['ore'].astype(np.float32)  # Already 0-1
-        transformed['rubble'] = (observation_input['rubble'] / self.envs.observation_space['rubble'].high).astype(np.float32)
-        transformed['units_map'] = observation_input['units_map'].astype(np.float32)  # Already 0-1
-        transformed['opponent_units_map'] = observation_input['opponent_units_map'].astype(np.float32)  # Already 0-1
-        transformed['lichen'] = (observation_input['lichen'] / self.envs.observation_space['lichen'].high).astype(np.float32)
-        transformed['opponent_lichen'] = (observation_input['opponent_lichen'] / self.envs.observation_space['opponent_lichen'].high).astype(np.float32)
-        transformed['lichen_strains'] = (observation_input['lichen_strains'] / self.envs.observation_space['lichen_strains'].high).astype(np.float32)
+        transformed['ice'] = th.tensor(observation_input['ice'].astype(np.float32))
+        transformed['ore'] = th.tensor(observation_input['ore'].astype(np.float32))
+        transformed['rubble'] = th.tensor((observation_input['rubble'] / self.envs.observation_space['rubble'].high).astype(np.float32))
+        transformed['units_map'] = th.tensor(observation_input['units_map'].astype(np.float32))
+        transformed['opponent_units_map'] = th.tensor(observation_input['opponent_units_map'].astype(np.float32))
+        transformed['lichen'] = th.tensor((observation_input['lichen'] / self.envs.observation_space['lichen'].high).astype(np.float32))
+        transformed['opponent_lichen'] = th.tensor((observation_input['opponent_lichen'] / self.envs.observation_space['opponent_lichen'].high).astype(np.float32))
+        transformed['lichen_strains'] = th.tensor((observation_input['lichen_strains'] / self.envs.observation_space['lichen_strains'].high).astype(np.float32))
 
         # Status
-        transformed['factories'] = (observation_input['factories'] / self.envs.observation_space['factories'].high).astype(np.float32)
-        transformed['opponent_factories'] = (observation_input['opponent_factories'] / self.envs.observation_space['opponent_factories'].high).astype(np.float32)
-        transformed['units'] = (observation_input['units'] / self.envs.observation_space['units'].high).astype(np.float32)
-        transformed['opponent_units'] = (observation_input['opponent_units'] / self.envs.observation_space['opponent_units'].high).astype(np.float32)
+        transformed['factories'] = th.tensor((observation_input['factories'] / self.envs.observation_space['factories'].high).astype(np.float32))
+        transformed['opponent_factories'] = th.tensor((observation_input['opponent_factories'] / self.envs.observation_space['opponent_factories'].high).astype(np.float32))
+        transformed['units'] = th.tensor((observation_input['units'] / self.envs.observation_space['units'].high).astype(np.float32))
+        transformed['opponent_units'] = th.tensor((observation_input['opponent_units'] / self.envs.observation_space['opponent_units'].high).astype(np.float32))
 
-        # Position
+        # Position - DO NOT CONVERT TO TENSOR
         transformed['pos_factories'] = observation_input['factories'][:, :, 1: 3]
         transformed['pos_units'] = observation_input['units'][:, :, 1: 3]
         transformed['pos_opponent_units'] = observation_input['opponent_units'][:, :, 1: 3]
@@ -271,6 +271,10 @@ class Agent(nn.Module):
                 for idx, m in enumerate(opponent_maps):
                     temp = transformed[m][env_id][xs: xe, ys: ye]
                     transformed['units_opponent_observe'][env_id, unit_id, idx] = np.pad(temp, padding, mode='constant', constant_values=-1)
+
+        transformed['units_observe'] = th.tensor(transformed['units_observe'])
+        transformed['units_opponent_observe'] = th.tensor(transformed['units_opponent_observe'])
+
         self.time_stats['transform'].append(time() - transform_start)
         return transformed
 
@@ -303,22 +307,23 @@ class Agent(nn.Module):
     def get_value(self, observation_input):
         # self = agent
         # observation_input = agent.transform(observations)
+
         feed_value_start = time()
         # Feed map
-        inp_m = self.to_cuda(th.tensor(np.stack([observation_input[k] for k in self.conf_map_layers], axis=1)))
+        inp_m = self.to_cuda(th.stack([observation_input[k] for k in self.conf_map_layers], dim=1))
         # as_opponent = True -> inp_m = th.tensor(np.stack([obs[k] for k in self.conf_map_layers_op], axis=1))
         out_map = self.critic_map(inp_m)
         # out_map.shape
 
         # Feed factories
-        inp_f = self.to_cuda(th.tensor(observation_input['factories']))
+        inp_f = self.to_cuda(observation_input['factories'])
         # inp_f.shape
         out_f = th.sum(self.critic_factories_status(inp_f), dim=1) / \
                 th.clip(inp_f[:, :, 0].sum(axis=1).reshape(-1, 1).repeat(1, self.conf_units_status_features), 1)
         # out_f.shape
 
         # Feed units
-        in_u = self.to_cuda(th.tensor(observation_input['units']))
+        in_u = self.to_cuda(observation_input['units'])
         # in_u.shape
         out_u = th.sum(self.critic_units_status(in_u), dim=1) / \
                 th.clip(in_u[:, :, 0].sum(axis=1).reshape(-1, 1).repeat(1, self.conf_units_status_features), 1)
@@ -346,8 +351,7 @@ class Agent(nn.Module):
         action_map_0 = time()
         # Feed map
 
-        inp_m = self.to_cuda(th.stack([th.tensor(observation_input[k]) for k in self.conf_map_layers], axis=1))
-        # inp_m = self.to_cuda(th.tensor(np.stack([observation_input[k] for k in self.conf_map_layers], axis=1)))
+        inp_m = self.to_cuda(th.stack([observation_input[k] for k in self.conf_map_layers], dim=1))
         # as_opponent = True -> inp_m = th.tensor(np.stack([observation_input[k] for k in self.conf_map_layers_op], axis=1))
         out_map = self.actor_map(inp_m)
         # out_map.shape
@@ -355,7 +359,7 @@ class Agent(nn.Module):
         action_map_1 = time()
         self.time_stats['action_map_1'].append(action_map_1 - action_map_0)
         # Feed factories
-        inp_f = self.to_cuda(th.tensor(observation_input['factories']))
+        inp_f = self.to_cuda(observation_input['factories'])
         # inp_f.shape
         out_f = self.actor_factories_status(inp_f)
         # out_f.shape
@@ -377,18 +381,18 @@ class Agent(nn.Module):
         # =====================
         action_unit_0 = time()
         # Feed unit area
-        in_uob = self.to_cuda(th.tensor(observation_input['units_observe']))
+        in_uob = self.to_cuda(observation_input['units_observe'])
         out_uob = self.actor_observe(in_uob.reshape((-1,) + in_uob.shape[2:])).reshape(in_uob.shape[:2] + (128,))
         # out_uob.shape
 
         # Feed units
-        in_u = self.to_cuda(th.tensor(observation_input['units']))
+        in_u = self.to_cuda(observation_input['units'])
         # in_u.shape
         out_u = self.actor_units_status(in_u)
         # out_u.shape
 
         # Feed enemies
-        in_ue = self.to_cuda(th.tensor(observation_input['opponent_units']))
+        in_ue = self.to_cuda(observation_input['opponent_units'])
         # in_ue.shape
         out_ue = self.actor_units_status(in_ue)
         # out_ue.shape
@@ -413,9 +417,13 @@ class Agent(nn.Module):
         action_units_gather_probs = Categorical(logits=action_units_gather)
         action_units_role_probs = Categorical(logits=action_units_role)
 
+        factory_filters = [np.where(observation_input['factories'][eid, :, 0])[0] for eid in range(self.envs.num_envs)]
+        units_filters = [np.where(observation_input['opponent_units'][eid, :, 0])[0] for eid in range(self.envs.num_envs)]
+        resource_filters = dict([(res, [np.argwhere(observation_input[res][eid]).numpy().T for eid in range(self.envs.num_envs)]) for res in ['ice', 'ore', 'rubble']])
+
         def find_closest_factory(eid, uid):
             start = time()
-            factory_filter = np.where(observation_input['factories'][eid, :, 0].astype(bool))[0]
+            factory_filter = factory_filters[eid]
             factory_dist = abs(observation_input['pos_units'][eid, uid] - observation_input['pos_factories'][eid]).sum(axis=1)
             res = factory_filter[np.argmin(factory_dist[factory_filter])]
             self.time_stats['find_factory'].append(time() - start)
@@ -423,7 +431,7 @@ class Agent(nn.Module):
 
         def find_closest_enemy(eid, uid):
             start = time()
-            units_filter = np.where(observation_input['opponent_units'][eid, :, 0].astype(bool))[0]
+            units_filter = units_filters[eid]
             if len(units_filter) == 0:
                 res = -1
             else:
@@ -434,7 +442,7 @@ class Agent(nn.Module):
 
         def find_closest_resource(eid, uid, resource_type):
             start = time()
-            resource_locs = np.argwhere(observation_input[resource_type][eid])
+            resource_locs = resource_filters[resource_type][eid]
             units_dist = abs(observation_input['pos_units'][eid, uid] - resource_locs).sum(axis=1)
             res = resource_locs[np.argmin(units_dist)] / 47  # 47 = map_size - 1
             self.time_stats['find_resource'].append(time() - start)
