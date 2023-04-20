@@ -185,6 +185,12 @@ class Agent(nn.Module):
             layer_init(nn.Linear(128, self.num_unit_role), std=0.01),
         )
 
+    def reset_units_data(self):
+        self.units_role = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
+        self.units_base = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
+        self.units_target = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
+        self.units_gather_loc = np.zeros((self.num_envs, self.max_unit, 2), dtype=np.float32) - 1
+
     def set_envs(self, envs):
         self.envs = envs
 
@@ -205,21 +211,23 @@ class Agent(nn.Module):
         # observation_input = observations
         transformed = dict()
         map_size = observation_input['ice'].shape[1]
+
+        np.expand_dims(self.envs.single_observation_space['rubble'].high, axis=0).repeat(100, axis=0)
         # Map
         transformed['ice'] = th.tensor(observation_input['ice'].astype(np.float32))
         transformed['ore'] = th.tensor(observation_input['ore'].astype(np.float32))
-        transformed['rubble'] = th.tensor((observation_input['rubble'] / self.envs.observation_space['rubble'].high).astype(np.float32))
         transformed['units_map'] = th.tensor(observation_input['units_map'].astype(np.float32))
         transformed['opponent_units_map'] = th.tensor(observation_input['opponent_units_map'].astype(np.float32))
-        transformed['lichen'] = th.tensor((observation_input['lichen'] / self.envs.observation_space['lichen'].high).astype(np.float32))
-        transformed['opponent_lichen'] = th.tensor((observation_input['opponent_lichen'] / self.envs.observation_space['opponent_lichen'].high).astype(np.float32))
-        transformed['lichen_strains'] = th.tensor((observation_input['lichen_strains'] / self.envs.observation_space['lichen_strains'].high).astype(np.float32))
+
+        for k in ['rubble', 'lichen', 'opponent_lichen', 'lichen_strains']:
+            div = np.expand_dims(self.envs.single_observation_space[k].high, axis=0).repeat(observation_input[k].shape[0], axis=0)
+            transformed[k] = th.tensor((observation_input[k] / div).astype(np.float32))
 
         # Status
-        transformed['factories'] = th.tensor((observation_input['factories'] / self.envs.observation_space['factories'].high).astype(np.float32))
-        transformed['opponent_factories'] = th.tensor((observation_input['opponent_factories'] / self.envs.observation_space['opponent_factories'].high).astype(np.float32))
-        transformed['units'] = th.tensor((observation_input['units'] / self.envs.observation_space['units'].high).astype(np.float32))
-        transformed['opponent_units'] = th.tensor((observation_input['opponent_units'] / self.envs.observation_space['opponent_units'].high).astype(np.float32))
+
+        for k in ['factories', 'opponent_factories', 'units', 'opponent_units']:
+            div = np.expand_dims(self.envs.single_observation_space[k].high, axis=0).repeat(observation_input[k].shape[0], axis=0)
+            transformed[k] = th.tensor((observation_input[k] / div).astype(np.float32))
 
         # Position - DO NOT CONVERT TO TENSOR
         transformed['pos_factories'] = observation_input['factories'][:, :, 1: 3]
@@ -337,9 +345,14 @@ class Agent(nn.Module):
         return res
 
     def get_action_and_value(self, observation_input, actions=None):
+        # ===== Dev Rollout
         # self = agent
         # observation_input = agent.transform(observations)
         # actions = None
+        # ===== Dev Optimizing
+        # self = agent
+        # observation_input = agent.transform(batch_observation[batch_idx])
+        # actions = batch_actions[batch_idx]
         feed_action_start = time()
         no_action = actions is None
         if no_action:
@@ -350,6 +363,8 @@ class Agent(nn.Module):
 
         action_map_0 = time()
         # Feed map
+
+        num_batch_input = observation_input['factories'].shape[0]
 
         inp_m = self.to_cuda(th.stack([observation_input[k] for k in self.conf_map_layers], dim=1))
         # as_opponent = True -> inp_m = th.tensor(np.stack([observation_input[k] for k in self.conf_map_layers_op], axis=1))
@@ -367,12 +382,12 @@ class Agent(nn.Module):
         action_map_2 = time()
         self.time_stats['action_map_2'].append(action_map_2 - action_map_1)
         # Predict factory action
-        action_factories = self.actor_factory(th.concat([out_map.reshape(self.envs.num_envs, 1, -1).repeat(1, self.max_factory, 1), out_f], dim=2))
+        action_factories = self.actor_factory(th.concat([out_map.reshape(num_batch_input, 1, -1).repeat(1, self.max_factory, 1), out_f], dim=2))
         action_factories_probs = Categorical(logits=action_factories)
         if no_action:
             actions['factories'] = action_factories_probs.sample()
-        log_probs['factories'] = action_factories_probs.log_prob(actions['factories'])
-        entropies['factories'] = action_factories_probs.entropy()
+        log_probs['factories'] = action_factories_probs.log_prob(actions['factories']).sum(1)
+        entropies['factories'] = action_factories_probs.entropy().sum(1)
         # action_factories_probs.probs  # real probs
         action_map_3 = time()
         self.time_stats['action_map_3'].append(action_map_3 - action_map_2)
@@ -398,10 +413,10 @@ class Agent(nn.Module):
         # out_ue.shape
 
         # Predict unit action
-        in_pre_unit = th.concat([out_map.reshape(self.num_envs, 1, -1).repeat(1, self.max_unit, 1), out_uob, out_u], dim=2)
-        in_pre_base = th.stack([out_f[eid][[self.units_base[eid]]] for eid in range(self.num_envs)])
-        in_pre_enemy = th.stack([out_ue[eid][[self.units_target[eid]]] for eid in range(self.num_envs)])
-        in_pre_gather = self.to_cuda(th.stack([th.tensor(self.units_gather_loc[eid]) for eid in range(self.num_envs)]))
+        in_pre_unit = th.concat([out_map.reshape(num_batch_input, 1, -1).repeat(1, self.max_unit, 1), out_uob, out_u], dim=2)
+        in_pre_base = th.stack([out_f[eid][[self.units_base[eid]]] for eid in range(num_batch_input)])
+        in_pre_enemy = th.stack([out_ue[eid][[self.units_target[eid]]] for eid in range(num_batch_input)])
+        in_pre_gather = self.to_cuda(th.stack([th.tensor(self.units_gather_loc[eid]) for eid in range(num_batch_input)]))
 
         action_units_base = self.actor_unit_base(th.concat([in_pre_unit, in_pre_base], dim=2))
         action_units_enemy = self.actor_unit_enemy(th.concat([in_pre_unit, in_pre_enemy], dim=2))
@@ -417,9 +432,9 @@ class Agent(nn.Module):
         action_units_gather_probs = Categorical(logits=action_units_gather)
         action_units_role_probs = Categorical(logits=action_units_role)
 
-        factory_filters = [np.where(observation_input['factories'][eid, :, 0])[0] for eid in range(self.envs.num_envs)]
-        units_filters = [np.where(observation_input['opponent_units'][eid, :, 0])[0] for eid in range(self.envs.num_envs)]
-        resource_filters = dict([(res, [np.argwhere(observation_input[res][eid]).numpy().T for eid in range(self.envs.num_envs)]) for res in ['ice', 'ore', 'rubble']])
+        factory_filters = [np.where(observation_input['factories'][eid, :, 0])[0] for eid in range(num_batch_input)]
+        units_filters = [np.where(observation_input['opponent_units'][eid, :, 0])[0] for eid in range(num_batch_input)]
+        resource_filters = dict([(res, [np.argwhere(observation_input[res][eid]).numpy().T for eid in range(num_batch_input)]) for res in ['ice', 'ore', 'rubble']])
 
         def find_closest_factory(eid, uid):
             start = time()
@@ -448,7 +463,7 @@ class Agent(nn.Module):
             self.time_stats['find_resource'].append(time() - start)
             return res
 
-        for eid in range(self.num_envs):
+        for eid in range(num_batch_input):
             for uid, role in enumerate(self.units_role[eid]):
                 # Initialize unit state
                 if self.units_role[eid, uid] == -1 and observation_input['units'][eid, uid, 0] > 0:
@@ -467,11 +482,11 @@ class Agent(nn.Module):
         # print(f'Feed Unit 2: {(action_unit_2 - action_unit_1) * 1000:4.0f} ms')
 
         if no_action:
-            action_units = th.zeros((self.num_envs, self.max_unit), dtype=th.int64)
+            action_units = th.zeros((num_batch_input, self.max_unit), dtype=th.int64)
             action_units_base = action_units_base_probs.sample().cpu().numpy()
             action_units_enemy = action_units_enemy_probs.sample().cpu().numpy()
             action_units_gather = action_units_gather_probs.sample().cpu().numpy()
-            for eid in range(self.num_envs):
+            for eid in range(num_batch_input):
                 for uid, role in enumerate(self.units_role[eid]):
                     # Assign units' action
                     if role == ROLES.BASE:
@@ -485,12 +500,12 @@ class Agent(nn.Module):
             action_units = actions['units']
         action_units_role = action_units_role_probs.sample().cpu().numpy()
 
-        log_probs_base = action_units_base_probs.log_prob(action_units).cpu().numpy()
-        log_probs_enemy = action_units_enemy_probs.log_prob(action_units).cpu().numpy()
-        log_probs_gather = action_units_gather_probs.log_prob(action_units).cpu().numpy()
+        log_probs_base = action_units_base_probs.log_prob(action_units).cpu()
+        log_probs_enemy = action_units_enemy_probs.log_prob(action_units).cpu()
+        log_probs_gather = action_units_gather_probs.log_prob(action_units).cpu()
 
         log_probs_all = []
-        for eid in range(self.num_envs):
+        for eid in range(num_batch_input):
             log_probs_all.append([])
             for uid, role in enumerate(self.units_role[eid]):
                 if role == ROLES.BASE:
@@ -500,15 +515,15 @@ class Agent(nn.Module):
                 elif role in ROLES.GATHER:
                     log_probs_all[eid].append(log_probs_gather[eid, uid])
                 else:
-                    log_probs_all[eid].append(th.tensor(np.nan))
-        log_probs['units'] = self.to_cuda(th.tensor(log_probs_all))
+                    log_probs_all[eid].append(th.tensor(0))
+        log_probs['units'] = self.to_cuda(th.tensor(log_probs_all)).sum(1)
 
-        entropy_base = action_units_base_probs.entropy().cpu().numpy()
-        entropy_enemy = action_units_enemy_probs.entropy().cpu().numpy()
-        entropy_gather = action_units_gather_probs.entropy().cpu().numpy()
+        entropy_base = action_units_base_probs.entropy().cpu()
+        entropy_enemy = action_units_enemy_probs.entropy().cpu()
+        entropy_gather = action_units_gather_probs.entropy().cpu()
 
         entropy_all = []
-        for eid in range(self.num_envs):
+        for eid in range(num_batch_input):
             entropy_all.append([])
             for uid, role in enumerate(self.units_role[eid]):
                 if role == ROLES.BASE:
@@ -518,14 +533,14 @@ class Agent(nn.Module):
                 elif role in ROLES.GATHER:
                     entropy_all[eid].append(entropy_gather[eid, uid])
                 else:
-                    entropy_all[eid].append(th.tensor(np.nan))
-        entropies['units'] = self.to_cuda(th.tensor(entropy_all))
+                    entropy_all[eid].append(th.tensor(0))
+        entropies['units'] = self.to_cuda(th.tensor(entropy_all)).sum(1)
 
         action_unit_3 = time()
         self.time_stats['action_unit_3'].append(action_unit_3 - action_unit_2)
         # print(f'Feed Unit 3: {(action_unit_3 - action_unit_2) * 1000:4.0f} ms')
 
-        for eid in range(self.num_envs):
+        for eid in range(num_batch_input):
             for uid, role in enumerate(self.units_role[eid]):
                 # Change role & Assign new target
                 new_role = action_units_role[eid, uid]
@@ -550,7 +565,7 @@ class Agent(nn.Module):
                         self.units_gather_loc[eid, uid] = find_closest_resource(eid, uid, 'rubble')
                         self.units_role[eid, uid] = new_role
 
-        res_actions = self.convert_parallel_actions(actions, self.num_envs)
+        res_actions = self.convert_parallel_actions(actions, num_batch_input)
         action_unit_4 = time()
         self.time_stats['action_unit_4'].append(action_unit_4 - action_unit_3)
         # print(f'Feed Unit 4: {(action_unit_4 - action_unit_3) * 1000:4.0f} ms')
@@ -564,6 +579,17 @@ class Agent(nn.Module):
             for eid in range(num_envs):
                 new_actions[eid][k] = actions[k][eid]
         return new_actions
+
+    def get_multi_action_and_value(self, x, action=None):
+        hidden = self.network(x)
+        logits = self.actor(hidden)
+        split_logits = th.split(logits, self.nvec.tolist(), dim=1)
+        multi_categoricals = [Categorical(logits=logits) for logits in split_logits]
+        if action is None:
+            action = th.stack([categorical.sample() for categorical in multi_categoricals])
+        logprob = th.stack([categorical.log_prob(a) for a, categorical in zip(action, multi_categoricals)])
+        entropy = th.stack([categorical.entropy() for categorical in multi_categoricals])
+        return action.T, logprob.sum(0), entropy.sum(0), self.critic(hidden)
 
 
 def test():
