@@ -34,3 +34,8 @@ def draw(env):
     env_board = env.render("rgb_array", width=48, height=48)
     plt.imshow(env_board)
     plt.show()
+
+
+def close_draw():
+    plt.close()
+

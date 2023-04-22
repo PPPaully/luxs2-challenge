@@ -6,298 +6,98 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 from torch.distributions import Categorical
+from luxai_s2 import LuxAI_S2
 
 from lux.config import EnvConfig
 from lux.kit import obs_to_game_state, GameState
 from lux.utils import my_turn_to_place_factory
+from lux.const import Direction, Resource
 
 from factory_setup import find_best_position
 from nn_utils import layer_init
 
 
-class ROLES:
-    BASE = 0
-    ENEMY = 1
-    GATHER = (2, 3, 4)
-    ICE = 2
-    ORE = 3
-    RUBBLE = 4
+def move_function(unit, direction):
+    def f():
+        return unit.move(direction)
 
-    @staticmethod
-    def is_role(a):
-        return ROLES.BASE <= a <= ROLES.RUBBLE
+    return f
+
+
+def transfer_function(unit, direction, resource, amount):
+    def f():
+        return unit.transfer(direction, resource, amount)
+
+    return f
+
+
+def get_transfer_direction(factory, unit) -> (bool, int):
+    """
+    Value of dist
+         (X   ,  Y)
+        +101-  +222+
+        2===2  1===1
+        2=F=2  0=F=0
+        2===2  1===1
+        +101-  -222-
+
+    :return can_transfer, direction_to_transfer
+    """
+    dist = factory.pos[0] - unit.pos[0], factory.pos[1] - unit.pos[1]
+    if abs(dist[0]) > 2 or abs(dist[1]) > 2 or (abs(dist[0]) == abs(dist[1]) == 2):
+        return False, -1
+
+    if dist[1] == -2:  # Direction.SHIFT[Direction.UP]
+        return True, Direction.UP
+    elif dist[1] == 2:  # Direction.SHIFT[Direction.DOWN]
+        return True, Direction.DOWN
+    elif dist[0] == -2:  # Direction.SHIFT[Direction.LEFT]
+        return True, Direction.LEFT
+    elif dist[0] == 2:  # Direction.SHIFT[Direction.RIGHT]
+        return True, Direction.RIGHT
+
+    return True, Direction.CENTER
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, player: str = 'player_0', is_cuda=False):
+    def __init__(self):
         super(Agent, self).__init__()
+        self.game_environments = dict()
+        self.game_player = dict()
+        self.game_opponent = dict()
+        self.game_states = dict()
+        self.game_actions = dict()
+        self.game_action_logs = dict()
+        self.default_env = None
 
+    def register(self, env_id, env, as_player='player_0'):
         players = ['player_0', 'player_1']
-        assert player in players
+        assert as_player in players
 
-        self.time_stats = dict(
-            transform=[],
-            feed_action=[],
-            feed_value=[],
-            tensor_cuda=[],
-            action_map_1=[],
-            action_map_2=[],
-            action_map_3=[],
-            action_unit_1=[],
-            action_unit_2=[],
-            action_unit_3=[],
-            action_unit_4=[],
-            find_factory=[],
-            find_enemy=[],
-            find_resource=[],
-        )
+        self.game_environments[env_id] = env
+        self.game_player[env_id] = as_player
+        self.game_opponent[env_id] = players[1 - players.index(as_player)]
+        self.game_states[env_id] = []
+        self.game_actions[env_id] = []
+        self.game_action_logs[env_id] = []
+        if self.default_env is None:
+            self.default_env = env_id
 
-        self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
-        self.player = player
-        self.opponent = players[1 - players.index(player)]
-        self.envs = envs
-        self.num_envs = envs.num_envs
-        self.envs_mapping = dict()
-        self.is_cuda = is_cuda
-
-        self.__init_model__()
-
-        self.max_factory = 1
-        self.max_unit = 1
-        self.units_role = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_base = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_target = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_gather_loc = np.zeros((self.num_envs, self.max_unit, 2), dtype=np.float32) - 1
-
-    def __init_model__(self):
-        self.conf_map_layers = [
-            'ice', 'ore', 'rubble',
-            'lichen', 'opponent_lichen', 'lichen_strains',
-            'units_map', 'opponent_units_map',
-        ]
-        self.conf_map_layers_op = [
-            'ice', 'ore', 'rubble',
-            'opponent_lichen', 'lichen', 'lichen_strains',
-            'opponent_units_map', 'units_map',
-        ]  # as_opponent
-        self.conf_map_features = 128
-
-        self.critic_map = nn.Sequential(
-            layer_init(nn.Conv2d(len(self.conf_map_layers), 32, kernel_size=3, padding=1)),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            layer_init(nn.Conv2d(32, 64, kernel_size=3)),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            layer_init(nn.Conv2d(64, self.conf_map_features, kernel_size=3)),
-            nn.ReLU(),
-            nn.MaxPool2d(9),
-            nn.Flatten(),
-        )
-
-        self.actor_map = nn.Sequential(
-            layer_init(nn.Conv2d(len(self.conf_map_layers), 32, kernel_size=3, padding=1)),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            layer_init(nn.Conv2d(32, 64, kernel_size=3)),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            layer_init(nn.Conv2d(64, self.conf_map_features, kernel_size=3)),
-            nn.ReLU(),
-            nn.MaxPool2d(9),
-            nn.Flatten(),
-        )
-
-        self.actor_observe = nn.Sequential(
-            layer_init(nn.Conv2d(len(self.conf_map_layers), 32, kernel_size=3, padding=1)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, kernel_size=3)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, self.conf_map_features, kernel_size=3)),
-            nn.ReLU(),
-            nn.MaxPool2d(3),
-            nn.Flatten(),
-        )
-
-        num_factory_status = 9
-        num_unit_status = 8
-        self.conf_factories_status_features = 64
-        self.conf_units_status_features = 64
-        self.conf_status_features = self.conf_factories_status_features + self.conf_units_status_features
-
-        self.critic_factories_status = nn.Sequential(
-            layer_init(nn.Linear(num_factory_status, self.conf_factories_status_features)),
-            nn.Tanh(),
-            layer_init(nn.Linear(self.conf_factories_status_features, self.conf_factories_status_features)),
-            nn.Tanh(),
-        )
-        self.critic_units_status = nn.Sequential(
-            layer_init(nn.Linear(num_unit_status, self.conf_units_status_features)),
-            nn.Tanh(),
-            layer_init(nn.Linear(self.conf_units_status_features, self.conf_units_status_features)),
-            nn.Tanh(),
-        )
-        self.critic_status = nn.Sequential(
-            layer_init(nn.Linear(self.conf_map_features + self.conf_status_features, self.conf_map_features + self.conf_status_features)),
-            nn.ReLU(),
-            layer_init(nn.Linear(self.conf_map_features + self.conf_status_features, 1), std=1),
-        )
-
-        self.actor_factories_status = nn.Sequential(
-            layer_init(nn.Linear(num_factory_status, self.conf_factories_status_features)),
-            nn.Tanh(),
-            layer_init(nn.Linear(self.conf_factories_status_features, self.conf_factories_status_features)),
-            nn.Tanh(),
-        )
-        self.actor_units_status = nn.Sequential(
-            layer_init(nn.Linear(num_unit_status, self.conf_units_status_features)),
-            nn.Tanh(),
-            layer_init(nn.Linear(self.conf_units_status_features, self.conf_units_status_features)),
-            nn.Tanh(),
-        )
-
-        self.num_factory_action = 4  # See scratch.py
-        self.num_unit_action = 8  # See scratch.py
-        self.num_unit_role = 5  # See scratch.py
-        self.actor_factory = nn.Sequential(
-            layer_init(nn.Linear(self.conf_map_features + self.conf_factories_status_features, 128)),
-            nn.ReLU(),
-            layer_init(nn.Linear(128, self.num_factory_action), std=0.01),
-        )
-        # self.actor_unit_base = nn.Sequential(  # Map, Observe, UnitStat, BaseStat
-        #     layer_init(nn.Linear(self.conf_map_features * 2 + self.conf_units_status_features * 2, 128)),
-        #     nn.ReLU(),
-        #     layer_init(nn.Linear(128, self.num_unit_action), std=0.01),
-        # )
-        # self.actor_unit_enemy = nn.Sequential(  # Map, Observe, UnitStat, EnemyStat
-        #     layer_init(nn.Linear(self.conf_map_features * 2 + self.conf_units_status_features * 2, 128)),
-        #     nn.ReLU(),
-        #     layer_init(nn.Linear(128, self.num_unit_action), std=0.01),
-        # )
-        self.actor_unit_gather = nn.Sequential(  # Observe, UnitStat, BaseStat, GatherPos
-            layer_init(nn.Linear(self.conf_map_features + self.conf_units_status_features * 2 + 2, 128)),
-            nn.ReLU(),
-            layer_init(nn.Linear(128, self.num_unit_action), std=0.01),
-        )
-        # self.actor_unit_role = nn.Sequential(  # Map, Observe, UnitStat, BaseStat
-        #     layer_init(nn.Linear(self.conf_map_features * 2 + self.conf_units_status_features * 2, 128)),
-        #     nn.ReLU(),
-        #     layer_init(nn.Linear(128, self.num_unit_role), std=0.01),
-        # )
-
-    def reset_units_data(self):
-        self.units_role = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_base = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_target = np.zeros((self.num_envs, self.max_unit), dtype=int) - 1
-        self.units_gather_loc = np.zeros((self.num_envs, self.max_unit, 2), dtype=np.float32) - 1
-
-    def set_envs(self, envs):
-        self.envs = envs
-
-    def handshake(self, wrapper_id, env_id):
-        self.envs_mapping[wrapper_id] = env_id
-
-    def to_cuda(self, a):
-        if self.is_cuda:
-            tensor_cuda_start = time()
-            res = a.to(self.device)
-            self.time_stats['tensor_cuda'].append(time() - tensor_cuda_start)
-            return res
-        return a
-
-    def transform(self, observation_input):
-        transform_start = time()
-        # self = agent
-        # observation_input = observations
-        transformed = dict()
-        map_size = observation_input['ice'].shape[1]
-
-        observation_space = self.envs.single_observation_space
-        # Map
-        transformed['ice'] = th.tensor(observation_input['ice'].astype(np.float32))
-        transformed['ore'] = th.tensor(observation_input['ore'].astype(np.float32))
-        transformed['units_map'] = th.tensor(observation_input['units_map'].astype(np.float32))
-        transformed['opponent_units_map'] = th.tensor(observation_input['opponent_units_map'].astype(np.float32))
-
-        for k in ['rubble', 'lichen', 'opponent_lichen', 'lichen_strains']:
-            div = np.expand_dims(observation_space[k].high, axis=0).repeat(observation_input[k].shape[0], axis=0)
-            transformed[k] = th.tensor((observation_input[k] / div).astype(np.float32))
-
-        # Status
-        for k in ['factories', 'opponent_factories', 'units', 'opponent_units']:
-            div = np.expand_dims(observation_space[k].high, axis=0).repeat(observation_input[k].shape[0], axis=0)
-            transformed[k] = th.tensor((observation_input[k] / div).astype(np.float32))
-
-        # Position - DO NOT CONVERT TO TENSOR
-        transformed['pos_factories'] = observation_input['factories'][:, :, 1: 3]
-        transformed['pos_units'] = observation_input['units'][:, :, 1: 3]
-        transformed['pos_opponent_units'] = observation_input['opponent_units'][:, :, 1: 3]
-
-        # Unit observe
-        observe_range = 3
-        observe_range_full = observe_range * 2 + 1
-        maps = ['ice', 'ore', 'rubble', 'units_map', 'opponent_units_map', 'lichen', 'opponent_lichen', 'lichen_strains']
-        opponent_maps = ['ice', 'ore', 'rubble', 'opponent_units_map', 'units_map', 'opponent_lichen', 'lichen', 'lichen_strains']
-        transformed['units_observe'] = np.zeros(observation_input['units'].shape[:2] + (len(maps), observe_range_full, observe_range_full), dtype=np.float32)
-        transformed['units_opponent_observe'] = np.zeros(observation_input['opponent_units'].shape[:2] + (len(maps), observe_range_full, observe_range_full), dtype=np.float32)
-
-        def calculate_padding(pos):
-            padding = np.asarray([0, 0, 0, 0])  # top, bot, left, right
-            xs, xe = pos[0] - observe_range, pos[0] + observe_range + 1
-            ys, ye = pos[1] - observe_range, pos[1] + observe_range + 1
-            if xs < 0:
-                padding[0] = -xs
-                xs = 0
-            if xe > map_size:
-                padding[1] = xe - map_size
-                xe = map_size
-            if ys < 0:
-                padding[2] = -ys
-                ys = 0
-            if ye > map_size:
-                padding[3] = ye - map_size
-                ye = map_size
-
-            return xs, xe, ys, ye, (padding[:2], padding[2:])
-
-        for env_id in range(observation_input['units'].shape[0]):
-            for unit_id, pack in enumerate(observation_input['units'][env_id, :, 0:3].tolist()):
-                alive, pos = pack[0], pack[1:]
-                if not alive:
-                    continue
-                xs, xe, ys, ye, padding = calculate_padding(pos)
-                for idx, m in enumerate(maps):
-                    temp = transformed[m][env_id][xs: xe, ys: ye]
-                    transformed['units_observe'][env_id, unit_id, idx] = np.pad(temp, padding, mode='constant', constant_values=-1)
-
-            for unit_id, pack in enumerate(observation_input['opponent_units'][env_id, :, 0:3].tolist()):
-                alive, pos = pack[0], pack[1:]
-                if not alive:
-                    continue
-                xs, xe, ys, ye, padding = calculate_padding(pos)
-                for idx, m in enumerate(opponent_maps):
-                    temp = transformed[m][env_id][xs: xe, ys: ye]
-                    transformed['units_opponent_observe'][env_id, unit_id, idx] = np.pad(temp, padding, mode='constant', constant_values=-1)
-
-        transformed['units_observe'] = th.tensor(transformed['units_observe'])
-        transformed['units_opponent_observe'] = th.tensor(transformed['units_opponent_observe'])
-
-        self.time_stats['transform'].append(time() - transform_start)
-        return transformed
-
-    def early_setup(self, step: int, obs, remainingOverageTime: int = 60, env_id: id = None, as_opponent: bool = False):
+    def early_setup(self, step: int, observation, remainingOverageTime: int = 60, env_id: str = None):
+        if env_id is None:
+            env_id = self.default_env
         if step == 0:
             return dict(faction='AlphaStrike', bid=0)
 
-        env_cfg = self.get_env_cfg(env_id)
-        player = self.get_player(as_opponent)
-        game_state: GameState = obs_to_game_state(step, env_cfg, obs)
+        env_cfg = self.game_environments[env_id].get_config()
+        player = self.game_player[env_id]
+        game_state: GameState = obs_to_game_state(step, env_cfg, observation)
 
         if my_turn_to_place_factory(game_state.teams[player].place_first, step)\
             and game_state.teams[player].factories_to_place > 0:
             num_factory = len(game_state.factories[player].values())
             action = dict()
-            action['spawn'] = find_best_position(step, obs, env_cfg, split=num_factory > 0, space=game_state.teams[player].factories_to_place == 1)
+            action['spawn'] = find_best_position(step, observation, env_cfg, split=num_factory > 0, space=game_state.teams[player].factories_to_place == 1)
             action['metal'] = game_state.teams[player].metal // game_state.teams[player].factories_to_place
             action['water'] = game_state.teams[player].water // game_state.teams[player].factories_to_place
 
@@ -305,362 +105,109 @@ class Agent(nn.Module):
 
         return dict()
 
-    def get_env_cfg(self, env_id=None) -> EnvConfig:
-        return self.envs.env_cfg if self.envs_mapping[env_id] is None else self.envs.envs[self.envs_mapping[env_id]].env_cfg
+    def act(self, step: int, observation, remainingOverageTime: int = 60, env_id: str = None):
+        if env_id is None:
+            env_id = self.default_env
 
-    def get_player(self, as_opponent=False):
-        return self.opponent if as_opponent else self.player
+        game_state = obs_to_game_state(step, self.game_environments[env_id].get_config(), observation)
+        self.game_states[env_id].append(game_state)
+        # vec_observation = self.transform_observation(observation, game_state, env_id)
+        actions, logs = self.get_action(game_state, env_id)
+        self.game_actions[env_id].append(actions)
+        self.game_action_logs[env_id].append(logs)
 
-    def get_value(self, observation_input):
-        # self = agent
-        # observation_input = agent.transform(observations)
+        return actions
 
-        feed_value_start = time()
-        # Feed map
-        inp_m = self.to_cuda(th.stack([observation_input[k] for k in self.conf_map_layers], dim=1))
-        # as_opponent = True -> inp_m = th.tensor(np.stack([obs[k] for k in self.conf_map_layers_op], axis=1))
-        out_map = self.critic_map(inp_m)
-        # out_map.shape
+    def get_action(self, game_state, env_id: str = None):
+        if env_id is None:
+            env_id = self.default_env
+        player = self.game_player[env_id]
+        opponent = self.game_opponent[env_id]
 
-        # Feed factories
-        inp_f = self.to_cuda(observation_input['factories'])
-        # inp_f.shape
-        out_f = th.sum(self.critic_factories_status(inp_f), dim=1) / \
-                th.clip(inp_f[:, :, 0].sum(axis=1).reshape(-1, 1).repeat(1, self.conf_units_status_features), 1)
-        # out_f.shape
+        player_actions = dict()
+        player_logs = dict()
+        factories = list(game_state.factories[player].values())
 
-        # Feed units
-        in_u = self.to_cuda(observation_input['units'])
-        # in_u.shape
-        out_u = th.sum(self.critic_units_status(in_u), dim=1) / \
-                th.clip(in_u[:, :, 0].sum(axis=1).reshape(-1, 1).repeat(1, self.conf_units_status_features), 1)
-        # out_u.shape
-
-        # Predict critic from all status
-        out_status = th.stack([out_f, out_u], dim=2).flatten(1)
-        res = self.critic_status(th.stack([out_map, out_status], dim=2).flatten(1))
-        self.time_stats['feed_value'].append(time() - feed_value_start)
-
-        return res
-
-    def get_action_and_value(self, observation_input, actions=None):
-        # ===== Dev Rollout
-        # self = agent
-        # observation_input = agent.transform(observations)
-        # actions = None
-        # ===== Dev Optimizing
-        # self = agent
-        # observation_input = agent.transform(batch_observation[batch_idx])
-        # actions = batch_actions[batch_idx]
-        feed_action_start = time()
-        no_action = actions is None
-        if no_action:
-            actions = dict()
-
-        log_probs = dict()
-        entropies = dict()
-
-        action_map_0 = time()
-        # Feed map
-
-        num_batch_input = observation_input['factories'].shape[0]
-
-        inp_m = self.to_cuda(th.stack([observation_input[k] for k in self.conf_map_layers], dim=1))
-        # as_opponent = True -> inp_m = th.tensor(np.stack([observation_input[k] for k in self.conf_map_layers_op], axis=1))
-        out_map = self.actor_map(inp_m)
-        # out_map.shape
-
-        action_map_1 = time()
-        self.time_stats['action_map_1'].append(action_map_1 - action_map_0)
-        # Feed factories
-        inp_f = self.to_cuda(observation_input['factories'])
-        # inp_f.shape
-        out_f = self.actor_factories_status(inp_f)
-        # out_f.shape
-
-        action_map_2 = time()
-        self.time_stats['action_map_2'].append(action_map_2 - action_map_1)
-        # Predict factory action
-        action_factories = self.actor_factory(th.concat([out_map.reshape(num_batch_input, 1, -1).repeat(1, self.max_factory, 1), out_f], dim=2))
-        action_factories_probs = Categorical(logits=action_factories)
-        if no_action:
-            actions['factories'] = action_factories_probs.sample()
-        log_probs['factories'] = action_factories_probs.log_prob(actions['factories']).sum(1)
-        entropies['factories'] = action_factories_probs.entropy().sum(1)
-        # action_factories_probs.probs  # real probs
-        action_map_3 = time()
-        self.time_stats['action_map_3'].append(action_map_3 - action_map_2)
-        # print(f'Feed Map: {(action_map_end - action_map_start) * 1000:4.0f} ms')
-
-        # =====================
-        action_unit_0 = time()
-
-        # Feed unit area
-        in_uob = self.to_cuda(observation_input['units_observe'])
-        out_uob = self.actor_observe(in_uob.reshape((-1,) + in_uob.shape[2:])).reshape(in_uob.shape[:2] + (128,))
-        # out_uob.shape
-
-        # Feed units
-        in_u = self.to_cuda(observation_input['units'])
-        # in_u.shape
-        out_u = self.actor_units_status(in_u)
-        # out_u.shape
-
-        # Feed enemies
-        in_ue = self.to_cuda(observation_input['opponent_units'])
-        # in_ue.shape
-        out_ue = self.actor_units_status(in_ue)
-        # out_ue.shape
-
-        factory_filters = [np.where(observation_input['factories'][eid, :, 0])[0] for eid in range(num_batch_input)]
-        # units_filters = [np.where(observation_input['opponent_units'][eid, :, 0])[0] for eid in range(num_batch_input)]
-        resource_filters = dict([(res, [np.argwhere(observation_input[res][eid]).numpy().T for eid in range(num_batch_input)]) for res in ['ice', 'ore', 'rubble']])
-
-        def find_closest_factory(eid, uid):
-            start = time()
-            factory_filter = factory_filters[eid]
-            factory_dist = abs(observation_input['pos_units'][eid, uid] - observation_input['pos_factories'][eid]).sum(axis=1)
-            res = factory_filter[np.argmin(factory_dist[factory_filter])]
-            self.time_stats['find_factory'].append(time() - start)
-            return res
-
-        # def find_closest_enemy(eid, uid):
-        #     start = time()
-        #     units_filter = units_filters[eid]
-        #     if len(units_filter) == 0:
-        #         res = -1
-        #     else:
-        #         units_dist = abs(observation_input['pos_units'][eid, uid] - observation_input['pos_opponent_units'][eid]).sum(axis=1)
-        #         res = units_filter[np.argmin(units_dist[units_filter])]
-        #     self.time_stats['find_enemy'].append(time() - start)
-        #     return res
-
-        def find_closest_resource(eid, uid, resource_type):
-            start = time()
-            resource_locs = resource_filters[resource_type][eid]
-            units_dist = abs(observation_input['pos_units'][eid, uid] - resource_locs).sum(axis=1)
-            res = resource_locs[np.argmin(units_dist)] / 47  # 47 = map_size - 1
-            self.time_stats['find_resource'].append(time() - start)
-            return res
-
-        # Initialize unit state
-        for eid in range(num_batch_input):
-            for uid, role in enumerate(self.units_role[eid]):
-                if self.units_role[eid, uid] == -1 and observation_input['units'][eid, uid, 0] > 0:
-                    self.units_role[eid, uid] = ROLES.ICE
-                    self.units_base[eid, uid] = find_closest_factory(eid, uid)
-                    self.units_target[eid, uid] = -1
-                    self.units_gather_loc[eid, uid] = find_closest_resource(eid, uid, resource_type='ice')
-                # else:  # Dead, Reset
-                #     self.units_role[eid, uid] = th.Tensor([-1, -1])
-                #     self.units_base[eid, uid] = th.Tensor([-1, -1])
-                #     self.units_target[eid, uid] = th.Tensor([-1, -1])
-                #     self.units_gather_loc[eid, uid] = th.Tensor([-1, -1])
-
-        action_unit_1 = time()
-        self.time_stats['action_unit_1'].append(action_unit_1 - action_unit_0)
-
-        # Predict unit action
-        in_pre_unit = th.concat([out_uob, out_u], dim=2)
-        in_pre_base = th.stack([out_f[eid][[self.units_base[eid]]] for eid in range(num_batch_input)])
-        # in_pre_enemy = th.stack([out_ue[eid][[self.units_target[eid]]] for eid in range(num_batch_input)])
-        in_pre_gather = self.to_cuda(th.stack([th.tensor(self.units_gather_loc[eid]) for eid in range(num_batch_input)]))
-
-        # action_units_base = self.actor_unit_base(th.concat([in_pre_unit, in_pre_base], dim=2))
-        # action_units_enemy = self.actor_unit_enemy(th.concat([in_pre_unit, in_pre_enemy], dim=2))
-        action_units_gather = self.actor_unit_gather(th.concat([in_pre_unit, in_pre_base, in_pre_gather], dim=2))
-        # action_units_role = self.actor_unit_role(th.concat([in_pre_unit, in_pre_base], dim=2))
-        # print(f'Feed Unit 1: {(action_unit_1 - action_unit_0) * 1000:4.0f} ms')
-
-        # action_units_base_probs = Categorical(logits=action_units_base)
-        # action_units_enemy_probs = Categorical(logits=action_units_enemy)
-        action_units_gather_probs = Categorical(logits=action_units_gather)
-        # action_units_role_probs = Categorical(logits=action_units_role)
-
-        action_unit_2 = time()
-        self.time_stats['action_unit_2'].append(action_unit_2 - action_unit_1)
-        # print(f'Feed Unit 2: {(action_unit_2 - action_unit_1) * 1000:4.0f} ms')
-
-        if no_action:
-            # action_units = th.zeros((num_batch_input, self.max_unit), dtype=th.int64)
-            # action_units_base = action_units_base_probs.sample().cpu().numpy()
-            # action_units_enemy = action_units_enemy_probs.sample().cpu().numpy()
-            # action_units_gather = action_units_gather_probs.sample().cpu().numpy()
-            # for eid in range(num_batch_input):
-            #     for uid, role in enumerate(self.units_role[eid]):
-            #         # Assign units' action
-            #         if role == ROLES.BASE:
-            #             action_units[eid, uid] = action_units_base[eid, uid]
-            #         elif role == ROLES.ENEMY:
-            #             action_units[eid, uid] = action_units_enemy[eid, uid]
-            #         else:
-            #             action_units[eid, uid] = action_units_gather[eid, uid]
-            # actions['units'] = action_units = self.to_cuda(action_units)
-            actions['units'] = action_units = action_units_gather_probs.sample()
-        else:
-            action_units = actions['units']
-        # action_units_role = action_units_role_probs.sample().cpu().numpy()
-
-        # log_probs_base = action_units_base_probs.log_prob(action_units).cpu()
-        # log_probs_enemy = action_units_enemy_probs.log_prob(action_units).cpu()
-        # log_probs_gather = action_units_gather_probs.log_prob(action_units).cpu()
-
-        # log_probs_all = []
-        # for eid in range(num_batch_input):
-        #     log_probs_all.append([])
-        #     for uid, role in enumerate(self.units_role[eid]):
-        #         if role == ROLES.BASE:
-        #             log_probs_all[eid].append(log_probs_base[eid, uid])
-        #         elif role == ROLES.ENEMY:
-        #             log_probs_all[eid].append(log_probs_enemy[eid, uid])
-        #         elif role in ROLES.GATHER:
-        #             log_probs_all[eid].append(log_probs_gather[eid, uid])
-        #         else:
-        #             log_probs_all[eid].append(th.tensor(0))
-        # log_probs['units'] = self.to_cuda(th.tensor(log_probs_all)).sum(1)
-        log_probs['units'] = action_units_gather_probs.log_prob(action_units).sum(1)
-
-        # entropy_base = action_units_base_probs.entropy().cpu()
-        # entropy_enemy = action_units_enemy_probs.entropy().cpu()
-        # entropy_gather = action_units_gather_probs.entropy().cpu()
-
-        # entropy_all = []
-        # for eid in range(num_batch_input):
-        #     entropy_all.append([])
-        #     for uid, role in enumerate(self.units_role[eid]):
-        #         if role == ROLES.BASE:
-        #             entropy_all[eid].append(entropy_base[eid, uid])
-        #         elif role == ROLES.ENEMY:
-        #             entropy_all[eid].append(entropy_enemy[eid, uid])
-        #         elif role in ROLES.GATHER:
-        #             entropy_all[eid].append(entropy_gather[eid, uid])
-        #         else:
-        #             entropy_all[eid].append(th.tensor(0))
-        # entropies['units'] = self.to_cuda(th.tensor(entropy_all)).sum(1)
-        entropies['units'] = action_units_gather_probs.entropy().sum(1)
-
-        action_unit_3 = time()
-        self.time_stats['action_unit_3'].append(action_unit_3 - action_unit_2)
-        # print(f'Feed Unit 3: {(action_unit_3 - action_unit_2) * 1000:4.0f} ms')
-
-        # Change role & Assign new target
-        # for eid in range(num_batch_input):
-        #     for uid, role in enumerate(self.units_role[eid]):
-        #         new_role = action_units_role[eid, uid]
-        #         if ROLES.is_role(action_units_role[eid, uid]) and role != new_role:  # Change role
-        #             if new_role == ROLES.BASE:  # Find Base
-        #                 # Old base not exists > Find New
-        #                 if observation_input['factories'][eid, self.units_base[eid, uid], 0] == 0:
-        #                     self.units_base[eid, uid] = find_closest_factory(eid, uid)
-        #                 self.units_role[eid, uid] = new_role
-        #             elif new_role == ROLES.ENEMY:  # Find Enemy
-        #                 self.units_target[eid, uid] = find_closest_enemy(eid, uid)
-        #                 # New target exists > change role
-        #                 if self.units_target[eid, uid] != -1:
-        #                     self.units_role[eid, uid] = new_role
-        #             elif new_role == ROLES.ICE:  # Find Ice
-        #                 self.units_gather_loc[eid, uid] = find_closest_resource(eid, uid, 'ice')
-        #                 self.units_role[eid, uid] = new_role
-        #             elif new_role == ROLES.ORE:  # Find Ore
-        #                 self.units_gather_loc[eid, uid] = find_closest_resource(eid, uid, 'ore')
-        #                 self.units_role[eid, uid] = new_role
-        #             elif new_role == ROLES.RUBBLE:  # Find Rubble
-        #                 self.units_gather_loc[eid, uid] = find_closest_resource(eid, uid, 'rubble')
-        #                 self.units_role[eid, uid] = new_role
-
-        res_actions = self.convert_parallel_actions(actions, num_batch_input)
-        action_unit_4 = time()
-        self.time_stats['action_unit_4'].append(action_unit_4 - action_unit_3)
-        # print(f'Feed Unit 4: {(action_unit_4 - action_unit_3) * 1000:4.0f} ms')
-        self.time_stats['feed_action'].append(time() - feed_action_start)
-        return res_actions, log_probs, entropies, self.get_value(observation_input)
-
-    @staticmethod
-    def convert_parallel_actions(actions, num_envs=10):
-        player = 'player_0'
-        new_actions = [{player: dict()} for _ in range(num_envs)]
-        for k in actions.keys():
-            for eid in range(num_envs):
-                new_actions[eid][player][k] = actions[k][eid]
-        return new_actions
-
-    def get_multi_action_and_value(self, x, action=None):
-        hidden = self.network(x)
-        logits = self.actor(hidden)
-        split_logits = th.split(logits, self.nvec.tolist(), dim=1)
-        multi_categoricals = [Categorical(logits=logits) for logits in split_logits]
-        if action is None:
-            action = th.stack([categorical.sample() for categorical in multi_categoricals])
-        logprob = th.stack([categorical.log_prob(a) for a, categorical in zip(action, multi_categoricals)])
-        entropy = th.stack([categorical.entropy() for categorical in multi_categoricals])
-        return action.T, logprob.sum(0), entropy.sum(0), self.critic(hidden)
+        units_pos_mapping = dict()
+        for u in game_state.units[player].values():
+            units_pos_mapping[tuple(u.pos)] = u
+        for u in game_state.units[opponent].values():
+            units_pos_mapping[tuple(u.pos)] = u
 
 
-def test():
-    from env_train import create_env
+        # player_team_id = game_state.teams[player].team_id
+        units = list(game_state.units[player].values())
+        base = factories[0]
 
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+        # Unit Action
+        for u in units:
+            can_move = False
+            move_flags = []
+            move_actions = []
+            for direction in Direction.all:
+                move_flags.append(Direction.shift(u.pos, direction) not in units_pos_mapping)
+                if move_flags[-1]:
+                    can_move = True
+                move_actions.append(move_function(u, direction))
+            move_dict = dict(flags=move_flags, actions=move_actions, logs=Direction.logs[1:])
 
-    num_envs = 4
-    num_steps = 200
-    envs = gym.vector.SyncVectorEnv([
-        create_env(
-            num_factories=1,
-            num_units=1,
-            with_opponent=False
-        ) for _ in range(num_envs)
-    ])
-    agent = Agent(envs, is_cuda=True).to(device)
-    for env_id, env in enumerate(envs.envs):
-        env.set_agent(agent, env_id)
-    observations = envs.reset()
+            can_dig = u.dig_cost(game_state) <= u.power
+            can_dig_ice = can_dig and game_state.board.ice[u.pos[0], u.pos[1]]
+            can_dig_ore = can_dig and game_state.board.ore[u.pos[0], u.pos[1]]
+            can_dig_rubble = can_dig and game_state.board.rubble[u.pos[0], u.pos[1]]
+            dig_act = u.dig
 
-    time_stats = dict(
-        turn=[],
-        feed=[],
-    )
+            can_transfer, transfer_direction = get_transfer_direction(base, u)
+            can_transfer_ice = can_transfer and u.cargo.ice > 0
+            can_transfer_ore = can_transfer and u.cargo.ore > 0
+            tf_ice_action = transfer_function(u, transfer_direction, Resource.ICE, u.cargo.ice)
+            tf_ore_action = transfer_function(u, transfer_direction, Resource.ORE, u.cargo.ore)
 
-    for _ in range(num_steps):
-        turn_start = time()
+            unit_actions = dict()
+            unit_actions['flags'] = [can_move, can_dig_ice, can_dig_ore, can_dig_rubble, can_transfer_ice,
+                                     can_transfer_ore]
+            unit_actions['actions'] = [move_dict, dig_act, dig_act, dig_act, tf_ice_action, tf_ore_action]
+            unit_actions['logs'] = ['MOV_', 'DIG', 'TF_ICE', 'TF_ORE']
 
-        feed_start = time()
-        actions, logprobs, entropies, values = agent.get_action_and_value(agent.transform(observations))
-        time_stats['feed'].append(time() - feed_start)
+            act = unit_actions
+            log = ''
+            while not callable(act):
+                p = act
+                choices = np.argwhere(p['flags']).flatten()
+                if len(choices) == 0:
+                    act = None
+                    break
+                choose = np.random.choice(choices)
+                act = p['actions'][choose]
+                log += p['logs'][choose]
 
-        observations, rewards, dones, infos = envs.step(actions)
-        time_stats['turn'].append(time() - turn_start)
+            if act is not None:
+                if log.startswith('MOV_'):
+                    direction = log.split('_')[1]
+                    new_pos = Direction.shift(u.pos, getattr(Direction, direction))
+                    units_pos_mapping[new_pos] = units_pos_mapping[tuple(u.pos)]
+                    # !! Collision can be happened if old_pos == others' new_pos
+                    # del units_pos_mapping[tuple(u.pos)]
 
-    all_envs_stats = dict()
-    for stat in ["observation", "action", "step"]:
-        all_envs_stats[stat] = []
-        for env in envs.envs:
-            all_envs_stats[stat] += env.env.time_stats[stat]
+                player_actions[u.unit_id] = [act()]
+                player_logs[u.unit_id] = [log]
 
-    print(f'Turn                   : {np.mean(time_stats["turn"])*1000:4.0f} ms ({1/np.mean(time_stats["turn"]):8.2f}/s) - Total {np.sum(time_stats["turn"]):6.2f} secs')
-    print(f'Networks - Feed        : {np.mean(time_stats["feed"])*1000:4.0f} ms ({1/np.mean(time_stats["feed"]):8.2f}/s) - Total {np.sum(time_stats["feed"]):6.2f} secs')
-    print(f'Networks - Transform   : {np.mean(agent.time_stats["transform"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["transform"]):8.2f}/s) x {len(agent.time_stats["transform"]):4d} times - Total {np.sum(agent.time_stats["transform"]):6.2f} secs')
-    print(f'Networks - Feed Action : {np.mean(agent.time_stats["feed_action"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["feed_action"]):8.2f}/s) x {len(agent.time_stats["feed_action"]):4d} times - Total {np.sum(agent.time_stats["feed_action"]):6.2f} secs')
-    print(f'Networks - Feed Map 1  : {np.mean(agent.time_stats["action_map_1"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_map_1"]):8.2f}/s) x {len(agent.time_stats["action_map_1"]):4d} times - Total {np.sum(agent.time_stats["action_map_1"]):6.2f} secs')
-    print(f'Networks - Feed Map 2  : {np.mean(agent.time_stats["action_map_2"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_map_2"]):8.2f}/s) x {len(agent.time_stats["action_map_2"]):4d} times - Total {np.sum(agent.time_stats["action_map_2"]):6.2f} secs')
-    print(f'Networks - Feed Map 3  : {np.mean(agent.time_stats["action_map_3"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_map_3"]):8.2f}/s) x {len(agent.time_stats["action_map_3"]):4d} times - Total {np.sum(agent.time_stats["action_map_3"]):6.2f} secs')
-    print(f'Networks - Feed Unit 1 : {np.mean(agent.time_stats["action_unit_1"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_unit_1"]):8.2f}/s) x {len(agent.time_stats["action_unit_1"]):4d} times - Total {np.sum(agent.time_stats["action_unit_1"]):6.2f} secs')
-    print(f'Networks - Feed Unit 2 : {np.mean(agent.time_stats["action_unit_2"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_unit_2"]):8.2f}/s) x {len(agent.time_stats["action_unit_2"]):4d} times - Total {np.sum(agent.time_stats["action_unit_2"]):6.2f} secs')
-    print(f'Networks - Feed Unit 3 : {np.mean(agent.time_stats["action_unit_3"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_unit_3"]):8.2f}/s) x {len(agent.time_stats["action_unit_3"]):4d} times - Total {np.sum(agent.time_stats["action_unit_3"]):6.2f} secs')
-    print(f'Networks - Feed Unit 4 : {np.mean(agent.time_stats["action_unit_4"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["action_unit_4"]):8.2f}/s) x {len(agent.time_stats["action_unit_4"]):4d} times - Total {np.sum(agent.time_stats["action_unit_4"]):6.2f} secs')
-    print(f'Networks - Find Factory: {np.mean(agent.time_stats["find_factory"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["find_factory"]):8.2f}/s) x {len(agent.time_stats["find_factory"]):4d} times - Total {np.sum(agent.time_stats["find_factory"]):6.2f} secs')
-    print(f'Networks - Find Enemy  : {np.mean(agent.time_stats["find_enemy"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["find_enemy"]):8.2f}/s) x {len(agent.time_stats["find_enemy"]):4d} times - Total {np.sum(agent.time_stats["find_enemy"]):6.2f} secs')
-    print(f'Networks - Find Res.   : {np.mean(agent.time_stats["find_resource"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["find_resource"]):8.2f}/s) x {len(agent.time_stats["find_resource"]):4d} times - Total {np.sum(agent.time_stats["find_resource"]):6.2f} secs')
-    print(f'Networks - Feed Value  : {np.mean(agent.time_stats["feed_value"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["feed_value"]):8.2f}/s) x {len(agent.time_stats["feed_value"]):4d} times - Total {np.sum(agent.time_stats["feed_value"]):6.2f} secs')
-    print(f'Networks - Cuda Tensor : {np.mean(agent.time_stats["tensor_cuda"])*1000:4.0f} ms ({1/np.mean(agent.time_stats["tensor_cuda"]):8.2f}/s) x {len(agent.time_stats["tensor_cuda"]):4d} times - Total {np.sum(agent.time_stats["tensor_cuda"]):6.2f} secs')
-    print(f'ENV. - T.Observation   : {np.mean(all_envs_stats["observation"])*1000:4.0f} ms ({1/np.mean(all_envs_stats["observation"]):8.2f}/s) x {len(all_envs_stats["observation"]):4d} times - Total {np.sum(all_envs_stats["observation"]):6.2f} secs')
-    print(f'ENV. - T.Action        : {np.mean(all_envs_stats["action"])*1000:4.0f} ms ({1/np.mean(all_envs_stats["action"]):8.2f}/s) x {len(all_envs_stats["action"]):4d} times - Total {np.sum(all_envs_stats["action"]):6.2f} secs')
-    print(f'ENV. - Step            : {np.mean(all_envs_stats["step"])*1000:4.0f} ms ({1/np.mean(all_envs_stats["step"]):8.2f}/s) x {len(all_envs_stats["step"]):4d} times - Total {np.sum(all_envs_stats["step"]):6.2f} secs')
+        # Factory Action
+        for f in factories:
+            vacancy = tuple(f.pos) not in units_pos_mapping
+            actions = [f.water, f.build_light, f.build_heavy]
+            flags = [f.can_water(game_state), vacancy and f.can_build_light(game_state), vacancy and f.can_build_heavy(game_state)]
+            logs = ['WATER', 'B_LIGHT', 'B_HEAVY']
+            choices = np.argwhere(flags).flatten()
+            if len(choices) > 0:
+                choose = np.random.choice(choices)
+                player_actions[f.unit_id] = actions[choose]()
+                player_logs[f.unit_id] = logs[choose]
 
-    # =============
-    # Debug
-    # from lux.utils import draw
-    # for env_id, env in enumerate(envs.envs):
-    #     draw(env.lux_env
+        return player_actions, player_logs
 
-    # Number of parameters
-    print(sum([np.prod(parameter.size()) for parameter in agent.parameters()]))
+    def get_reward(self, observation, stats, env_id: str = None):
+        if env_id is None:
+            env_id = self.default_env
+
+        return 0
