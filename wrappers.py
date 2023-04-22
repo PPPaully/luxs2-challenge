@@ -5,13 +5,14 @@ from luxai_s2 import LuxAI_S2
 from luxai_s2.state import StatsStateDict
 
 from lux.kit import obs_to_game_state
-from parallel_env import VectorWrapper
+from env_vector import VectorWrapper
 
 
 class SkipSetupWrapper(gym.Wrapper):
-    def __init__(self, env: VectorWrapper, with_opponent=True):
+    def __init__(self, env: VectorWrapper, num_factories=1, with_opponent=True):
         super().__init__(env)
         self.env = env
+        self.num_factories = num_factories
         self.with_opponent = with_opponent
         self.prev_step_metrics = None
 
@@ -23,7 +24,9 @@ class SkipSetupWrapper(gym.Wrapper):
         # self = env
         player = 'player_0'
         opponent = 'player_1'
-        obs = self.env.lux_env.reset(**kwargs)
+        self.env.lux_env.env_cfg.MIN_FACTORIES = self.num_factories
+        self.env.lux_env.env_cfg.MAX_FACTORIES = self.num_factories
+        obs = self.env.lux_env.reset()
 
         step = 0
         while self.env.lux_env.state.real_env_steps < 0:
@@ -50,9 +53,9 @@ class SkipSetupWrapper(gym.Wrapper):
             opp_factories = self.env.state.factories[opponent]
             for k in opp_factories.keys():
                 factory = opp_factories[k]
-                factory.cargo.water = 1000 # Keep enemy alive
+                factory.cargo.water = 1000  # Keep enemy alive
 
-        observation, rewards, dones, _ = self.env.step(action, self.with_opponent)
+        observation, rewards, dones, _ = self.env.step(action)
 
         infos = dict()
         stats: StatsStateDict = self.env.lux_env.state.stats[player]
@@ -81,11 +84,11 @@ class SkipSetupWrapper(gym.Wrapper):
         return observation, rewards[player], dones[player], infos
 
 
-def create_env(with_opponent=False):
+def create_env(num_factories=1, with_opponent=False):
     def thunk() -> VectorWrapper:
         env = LuxAI_S2(collect_stats=True)
         env = VectorWrapper(env)
-        env = SkipSetupWrapper(env, with_opponent)
+        env = SkipSetupWrapper(env, num_factories=num_factories, with_opponent=with_opponent)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
     return thunk
