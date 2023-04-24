@@ -22,8 +22,8 @@ class Factory:
     def build_heavy_power_cost(self, game_state):
         unit_cfg = self.env_cfg.ROBOTS["HEAVY"]
         return unit_cfg.POWER_COST
-    def can_build_heavy(self, game_state):
-        return self.power >= self.build_heavy_power_cost(game_state) and self.cargo.metal >= self.build_heavy_metal_cost(game_state)
+    def can_build_heavy(self, game_state, reserve_power=0):
+        return self.power - reserve_power >= self.build_heavy_power_cost(game_state) and self.cargo.metal >= self.build_heavy_metal_cost(game_state)
     def build_heavy(self):
         return 1
 
@@ -33,8 +33,8 @@ class Factory:
     def build_light_power_cost(self, game_state):
         unit_cfg = self.env_cfg.ROBOTS["LIGHT"]
         return unit_cfg.POWER_COST
-    def can_build_light(self, game_state):
-        return self.power >= self.build_light_power_cost(game_state) and self.cargo.metal >= self.build_light_metal_cost(game_state)
+    def can_build_light(self, game_state, reserve_power=0):
+        return self.power - reserve_power >= self.build_light_power_cost(game_state) and self.cargo.metal >= self.build_light_metal_cost(game_state)
 
     def build_light(self):
         return 0

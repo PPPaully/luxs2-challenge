@@ -4,7 +4,7 @@ from luxai_s2.env import LuxAI_S2
 
 
 class TrainWrapper(gym.Wrapper):
-    def __init__(self, env: LuxAI_S2, num_factories=1, num_units=1):
+    def __init__(self, env: LuxAI_S2, num_factories=1):
         super().__init__(env)
 
         self.env_id = f'{id(self)}'
@@ -16,7 +16,6 @@ class TrainWrapper(gym.Wrapper):
             self.agents[p] = None
             self.keep_alive[p] = True
         self.num_factories = num_factories
-        self.num_units = num_units
         self.last_observation = None
 
     def get_config(self):
@@ -25,12 +24,16 @@ class TrainWrapper(gym.Wrapper):
     def set_agent(self, agent, as_player, keep_alive=False):
         self.agents[as_player] = agent
         self.keep_alive[as_player] = keep_alive
-        agent.register(self.env_id + '_' + as_player, self, as_player)
+        if agent is not None:
+            agent.register(self.env_id + '_' + as_player, self, as_player)
 
     def reset(self, **kwargs):
         # self = env
         self.lux_env.env_cfg.MIN_FACTORIES = self.num_factories
         self.lux_env.env_cfg.MAX_FACTORIES = self.num_factories
+        for player in self.players:
+            if self.agents[player] is not None:
+                self.agents[player].reset(self.env_id + '_' + player)
         self.last_observation = self.lux_env.reset()
 
         step = 0
@@ -59,15 +62,19 @@ class TrainWrapper(gym.Wrapper):
 
         rewards = dict()
         for player in self.players:
-            rewards[player] = self.agents[player].get_reward(
-                self.last_observation[player],
-                self.lux_env.state.stats[player],
-                env_id=self.env_id + '_' + player
-            ) if not dones[player] else lux_rewards[player]
+            if self.agents[player] is not None:
+                rewards[player] = self.agents[player].get_reward(
+                    self.last_observation[player],
+                    self.lux_env.state.stats[player],
+                    env_id=self.env_id + '_' + player
+                ) if not dones[player] else lux_rewards[player]
+            else:
+                rewards[player] = lux_rewards[player]
 
         return self.last_observation, rewards, dones, infos
 
     def next_step(self):
+        # self = env
         actions = dict()
         for player in self.players:
             if self.agents[player] is not None:
@@ -103,10 +110,10 @@ class TrainWrapper(gym.Wrapper):
         return time_stats
 
 
-def create_env(num_factories=1, num_units=1):
+def create_env(num_factories=1):
     def thunk() -> TrainWrapper:
         env = LuxAI_S2(collect_stats=True)
-        env = TrainWrapper(env, num_factories, num_units)
+        env = TrainWrapper(env, num_factories)
         # env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
     return thunk
